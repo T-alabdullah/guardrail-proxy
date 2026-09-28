@@ -69,3 +69,28 @@ S13: Elections.
 - Without guard, llama3.2 refuses hotwiring itself, but finish_reason "stop" -> not machine-readable.
   Guard gives content_filter + S2, and works independent of which model is behind it
 - Non-streaming output check: user waits for full generation + a guard check before seeing anything
+
+
+## Step 4c – streaming + output guard, strategy D (python test_stream_guard.py)
+Decision: D = stream immediately, check the growing answer in the background, cut on unsafe.
+
+Run 1 (all safe), "count one to forty", 99 tokens:
+- No guard:   TTFT 177 ms, total 8505 ms, 11.8 tok/s
+- Guard (D):  TTFT 5044 ms, total 19242 ms, 6.9 tok/s  -> total +126%, gen -42%
+- TTFT: input check 4889 ms, of which 2871 ms = Llama Guard reload (unloaded after 5 min keep-alive)
+- Generation slower because guard runs on the SAME CPU: ollama eval 8349 -> 13047 ms for 99 tokens
+- Checks ran during generation (102, 202, 307 chars) + tail check at 400 chars after generation
+- Each check 1.1-2.3 s; guard busy almost continuously; tail check adds ~1.2 s to the end
+- Each check re-reads the whole answer; prompt eval stays 1-2 s -> cost grows with answer length
+
+Run 2 (GUARD_TEST_FAKE_UNSAFE_WORD=twenty, simulated unsafe output):
+- Guarded stream cut at "twenty-six": finish_reason content_filter, S1, 57 of 99 tokens generated
+- "twenty" first sent at ~char 144, cut at char 226 -> ~82 chars (~20 tokens, ~2.5 s) of "unsafe" text leaked
+- Log: check 1 at 102 chars safe (1443 ms, "twenty" appeared during it);
+  next check only after 100 more chars (STREAM_GUARD_MIN_CHARS); check 2 at 202 chars unsafe (1427 ms)
+- Leak window ~= wait until next check starts + check duration
+  -> smaller MIN_CHARS = smaller window but more checks + more CPU contention
+- TTFT 261 ms: input guard only 142 ms (guard warm + identical prompt in prefix cache) vs 5044 ms cold in run 1
+
+Conclusion D: fast TTFT, but can't prevent leaks; ~20 tokens here. OK for low-severity,
+not for S4/S9. Client must honor content_filter. Hybrid (D normally, C for high risk) is the realistic design.

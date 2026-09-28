@@ -1,11 +1,13 @@
 """guardrail-proxy: an OpenAI-compatible /v1/chat/completions endpoint in front of Ollama.
 
 optional Llama Guard check, switched on per request with "guardrails": true.
-- The input is checked before the model runs (streaming and non-streaming).
-- The output is checked after generation (non-streaming only, for now).
-- A blocked request returns 200 with a refusal, finish_reason "content_filter",
-  and a "guardrail" field naming the Llama Guard category.
+- Input: checked before the model runs (streaming and non-streaming).
+- Output, non-streaming: checked after generation, before anything is sent.
+- Output, streaming (strategy D): tokens are sent immediately while the growing answer
+  is checked in the background. An unsafe verdict cuts the stream.
+- Anything blocked returns 200 with finish_reason "content_filter" and a "guardrail" field.
 """
+import asyncio
 import json
 import logging
 import os
@@ -24,6 +26,10 @@ OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434")
 TIMEOUT = httpx.Timeout(300.0, connect=5.0)
 # If Llama Guard itself fails: "closed" = refuse the request (503), "open" = let it through unchecked.
 GUARD_FAIL_MODE = os.getenv("GUARD_FAIL_MODE", "closed")
+# Streaming: start a new background check once this many unchecked characters have been sent.
+STREAM_GUARD_MIN_CHARS = int(os.getenv("STREAM_GUARD_MIN_CHARS", "100"))
+# TEST ONLY: treat any output containing this word as unsafe (S1), to demo a cut-off stream.
+FAKE_UNSAFE_WORD = os.getenv("GUARD_TEST_FAKE_UNSAFE_WORD", "").strip().lower()
 log = logging.getLogger("uvicorn.error")  # shows up in the uvicorn terminal
 
 # OpenAI parameter name -> Ollama "options" name
@@ -43,6 +49,8 @@ ZERO_USAGE = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
 async def lifespan(app: FastAPI):
     # One shared HTTP client for the lifetime of the service (reuses connections).
     app.state.ollama = httpx.AsyncClient(base_url=OLLAMA_URL, timeout=TIMEOUT)
+    if FAKE_UNSAFE_WORD:
+        log.warning("TEST MODE: outputs containing %r will be treated as unsafe", FAKE_UNSAFE_WORD)
     yield
     await app.state.ollama.aclose()
 
@@ -69,6 +77,11 @@ def error_from_ollama(r: httpx.Response) -> JSONResponse:
     if r.status_code == 404:
         return openai_error(404, detail, code="model_not_found")
     return openai_error(502, f"Ollama error: {detail}", "api_error")
+
+
+def guard_unavailable() -> JSONResponse:
+    return openai_error(503, "The content guardrail is unavailable, so the request was not processed.",
+                        "api_error", code="guardrail_unavailable")
 
 
 # ---------- helpers: translation ----------
@@ -182,6 +195,25 @@ def log_timings(data: dict, stream: bool) -> None:
 
 # ---------- helpers: guardrails ----------
 
+async def check(client: httpx.AsyncClient, convo: list[dict], stage: str):
+    """Run Llama Guard on a conversation; it judges the last turn.
+    Returns a Verdict, or None if the guard failed and GUARD_FAIL_MODE=open.
+    Raises guard.GuardError if the guard failed and GUARD_FAIL_MODE=closed."""
+    try:
+        verdict = await guard.classify(client, convo)
+    except guard.GuardError as e:
+        log.error("guard %s check failed: %s", stage, e)
+        if GUARD_FAIL_MODE == "open":
+            log.warning("GUARD_FAIL_MODE=open: continuing without a %s check", stage)
+            return None
+        raise
+    last = convo[-1]["content"] if convo else ""
+    if stage == "output" and FAKE_UNSAFE_WORD and FAKE_UNSAFE_WORD in last.lower():
+        verdict = guard.Verdict(safe=False, categories=["S1"], raw="(test trigger)", elapsed_ms=verdict.elapsed_ms)
+    log.info("guard %s (%d chars): %s (%.0f ms)", stage, len(last), verdict.summary(), verdict.elapsed_ms)
+    return verdict
+
+
 def refusal_text(verdict: guard.Verdict, stage: str) -> str:
     what = "request" if stage == "input" else "response"
     return f"Sorry, I can't help with that. The {what} was blocked by the content guardrail ({verdict.describe()})."
@@ -203,21 +235,6 @@ def guard_headers(verdicts: list) -> dict:
         "x-guardrail-blocked": "true" if blocked else "false",
         "x-guardrail-categories": ",".join(c for v in blocked for c in v.categories),
     }
-
-
-async def run_guard(request: Request, messages: list[dict], stage: str):
-    """Returns (verdict, error_response). Both are None if the guard failed and GUARD_FAIL_MODE=open."""
-    try:
-        verdict = await guard.classify(request.app.state.ollama, messages)
-    except guard.GuardError as e:
-        log.error("guard %s check failed: %s", stage, e)
-        if GUARD_FAIL_MODE == "open":
-            log.warning("GUARD_FAIL_MODE=open: continuing without a %s check", stage)
-            return None, None
-        return None, openai_error(503, "The content guardrail is unavailable, so the request was not processed.",
-                                  "api_error", code="guardrail_unavailable")
-    log.info("guard %s: %s (%.0f ms)", stage, verdict.summary(), verdict.elapsed_ms)
-    return verdict, None
 
 
 def blocked_input_response(body: dict, verdict: guard.Verdict, stream: bool):
@@ -273,9 +290,10 @@ async def chat_completions(request: Request):
 
     input_verdict = None
     if guardrails:
-        input_verdict, err = await run_guard(request, messages, "input")
-        if err:
-            return err
+        try:
+            input_verdict = await check(request.app.state.ollama, messages, "input")
+        except guard.GuardError:
+            return guard_unavailable()
         if input_verdict and not input_verdict.safe:
             return blocked_input_response(body, input_verdict, stream)
 
@@ -286,8 +304,9 @@ async def chat_completions(request: Request):
 
 async def non_stream_completion(request: Request, body: dict, messages: list[dict],
                                 guardrails: bool, input_verdict):
+    client = request.app.state.ollama
     try:
-        r = await request.app.state.ollama.post("/api/chat", json=to_ollama_request(body, messages, stream=False))
+        r = await client.post("/api/chat", json=to_ollama_request(body, messages, stream=False))
     except httpx.RequestError as e:
         return openai_error(502, f"Could not reach Ollama at {OLLAMA_URL}: {e}", "api_error")
     if r.status_code != 200:
@@ -302,9 +321,10 @@ async def non_stream_completion(request: Request, body: dict, messages: list[dic
 
     if guardrails:
         # Output check: the same conversation plus the model's answer as the last (assistant) turn.
-        out_verdict, err = await run_guard(request, messages + [{"role": "assistant", "content": content}], "output")
-        if err:
-            return err
+        try:
+            out_verdict = await check(client, messages + [{"role": "assistant", "content": content}], "output")
+        except guard.GuardError:
+            return guard_unavailable()
         if out_verdict:
             verdicts.append(out_verdict)
             if not out_verdict.safe:
@@ -339,16 +359,16 @@ async def stream_completion(request: Request, body: dict, messages: list[dict],
         await upstream.aclose()
         return error_from_ollama(upstream)
 
+    if guardrails:
+        events = guarded_sse_events(client, upstream, body["model"], wants_usage(body), messages)
+    else:
+        events = sse_events(upstream, body["model"], wants_usage(body))
     headers = {"Cache-Control": "no-cache", **guard_headers([input_verdict] if input_verdict else [])}
-    return StreamingResponse(
-        sse_events(upstream, body["model"], wants_usage(body), guardrails),
-        media_type="text/event-stream",
-        headers=headers,
-    )
+    return StreamingResponse(events, media_type="text/event-stream", headers=headers)
 
 
-async def sse_events(upstream: httpx.Response, model: str, include_usage: bool, guardrails: bool):
-    """Translate Ollama's NDJSON stream into OpenAI's SSE chunk format."""
+async def sse_events(upstream: httpx.Response, model: str, include_usage: bool):
+    """No guardrail: translate Ollama's NDJSON stream into OpenAI's SSE chunk format."""
     chunk = make_chunker(model)
     try:
         # First chunk announces the role, as OpenAI does.
@@ -362,7 +382,7 @@ async def sse_events(upstream: httpx.Response, model: str, include_usage: bool, 
             if "error" in data:
                 # Status 200 has already been sent; the only place left for the error is the stream.
                 yield sse({"error": {"message": data["error"], "type": "api_error", "param": None, "code": None}})
-                break
+                return
 
             text = data.get("message", {}).get("content", "")
             if text:
@@ -370,11 +390,7 @@ async def sse_events(upstream: httpx.Response, model: str, include_usage: bool, 
 
             if data.get("done"):
                 log_timings(data, stream=True)
-                final = chunk({}, finish_reason_from(data))
-                if guardrails:
-                    final["guardrail"] = guard_info()
-                    log.warning("stream: output was NOT checked by the guardrail (step 4c)")
-                yield sse(final)
+                yield sse(chunk({}, finish_reason_from(data)))
                 if include_usage:
                     yield sse(usage_chunk(chunk, usage_from(data)))
                 break
@@ -383,6 +399,121 @@ async def sse_events(upstream: httpx.Response, model: str, include_usage: bool, 
     finally:
         # Also runs if the caller disconnects mid-stream: closing the upstream
         # connection makes Ollama stop generating for nobody.
+        await upstream.aclose()
+
+
+async def guarded_sse_events(client: httpx.AsyncClient, upstream: httpx.Response, model: str,
+                             include_usage: bool, messages: list[dict]):
+    """Strategy D: send every token immediately and check the growing answer in the background.
+    If a check says unsafe, stop generating and end the stream with content_filter.
+    Whatever was sent before the cut has already been seen: that is the leak window D accepts."""
+    chunk = make_chunker(model)
+    sent = ""            # everything the caller has received so far
+    tokens_sent = 0
+    safe_len = 0         # longest prefix of `sent` that a check has confirmed as safe
+    check_task = None    # the background check currently running, if any
+    check_len = 0        # how much of `sent` that check covers
+    checks = 0
+    blocked = None
+    done_data = None
+    start = time.perf_counter()
+
+    def start_check():
+        nonlocal check_task, check_len, checks
+        check_len = len(sent)
+        checks += 1
+        convo = messages + [{"role": "assistant", "content": sent}]
+        check_task = asyncio.create_task(check(client, convo, "output"))
+
+    try:
+        yield sse(chunk({"role": "assistant", "content": ""}))
+
+        async for line in upstream.aiter_lines():
+            if not line.strip():
+                continue
+            data = json.loads(line)
+
+            if "error" in data:
+                yield sse({"error": {"message": data["error"], "type": "api_error", "param": None, "code": None}})
+                return
+
+            text = data.get("message", {}).get("content", "")
+            if text:
+                yield sse(chunk({"content": text}))  # sent BEFORE it is checked: that's strategy D
+                sent += text
+                tokens_sent += 1
+
+            # Collect a background check that has finished.
+            if check_task is not None and check_task.done():
+                verdict = check_task.result()  # raises GuardError if the guard failed (fail-closed)
+                check_task = None
+                if verdict is not None and not verdict.safe:
+                    blocked = verdict
+                    break
+                safe_len = check_len
+
+            # Start the next check once enough unchecked text has been sent.
+            if check_task is None and len(sent) - safe_len >= STREAM_GUARD_MIN_CHARS:
+                start_check()
+
+            if data.get("done"):
+                done_data = data
+                break
+
+        # Generation ended without a block: the tail of the answer still needs checking.
+        if blocked is None:
+            if check_task is not None:
+                verdict = await check_task
+                check_task = None
+                if verdict is not None and not verdict.safe:
+                    blocked = verdict
+                else:
+                    safe_len = check_len
+            if blocked is None and safe_len < len(sent):
+                start_check()
+                verdict = await check_task
+                check_task = None
+                if verdict is not None and not verdict.safe:
+                    blocked = verdict
+                else:
+                    safe_len = check_len
+
+        if blocked is not None:
+            await upstream.aclose()  # stop Ollama generating the rest of the answer
+            elapsed = (time.perf_counter() - start) * 1000
+            log.warning("stream guard: %s after %.0f ms and %d checks. Already sent: %d chars (~%d tokens), "
+                        "%d chars of them after the last safe check (leak window)",
+                        blocked.summary(), elapsed, checks, len(sent), tokens_sent, len(sent) - safe_len)
+            yield sse(chunk({"content": f"\n\n[Response stopped by the content guardrail ({blocked.describe()}).]"}))
+            final = chunk({}, "content_filter")
+            final["guardrail"] = {**guard_info(blocked, "output"), "chars_sent_before_cut": len(sent)}
+            yield sse(final)
+            if include_usage:
+                if done_data:
+                    usage = usage_from(done_data)
+                else:
+                    usage = {"prompt_tokens": 0, "completion_tokens": tokens_sent, "total_tokens": tokens_sent}
+                yield sse(usage_chunk(chunk, usage))
+            yield "data: [DONE]\n\n"
+            return
+
+        done_data = done_data or {}
+        log_timings(done_data, stream=True)
+        log.info("stream guard: all %d chars checked in %d checks, safe", len(sent), checks)
+        final = chunk({}, finish_reason_from(done_data))
+        final["guardrail"] = guard_info()
+        yield sse(final)
+        if include_usage:
+            yield sse(usage_chunk(chunk, usage_from(done_data)))
+        yield "data: [DONE]\n\n"
+
+    except guard.GuardError:
+        # Fail-closed and the guard broke mid-stream: 200 is already sent, so say it in the stream.
+        yield sse({"error": {"message": "The content guardrail became unavailable; the response was stopped.",
+                             "type": "api_error", "param": None, "code": "guardrail_unavailable"}})
+    finally:
+        if check_task is not None and not check_task.done():
+            check_task.cancel()
         await upstream.aclose()
 
 
