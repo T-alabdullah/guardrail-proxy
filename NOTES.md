@@ -40,3 +40,32 @@
   Same problem as output guardrails: you can't take back what's already sent.
 - Mid-stream errors can only go into the stream as an SSE error event, not as an HTTP status
 - Model answered "why is the sea salty" only half right -> a guardrail checks harm, not correctness
+
+## Llama Guard categories
+
+S1: Violent Crimes.
+S2: Non-Violent Crimes.
+S3: Sex Crimes.
+S4: Child Exploitation.
+S5: Defamation.
+S6: Specialized Advice.
+S7: Privacy.
+S8: Intellectual Property.
+S9: Indiscriminate Weapons.
+S10: Hate.
+S11: Self-Harm.
+S12: Sexual Content.
+S13: Elections.
+
+
+## Step 4a – input + output guard (python test_guard.py)
+- All tests pass: safe passes, unsafe -> content_filter + S2, stream refusal is a stream, "yes" -> 400
+- Llama Guard prompt ~200 tokens for a 7-word user prompt (template + category list); answer 2-5 tokens
+- Guard cost = mostly prompt processing: ~1-2.5 s per check on CPU (warm)
+- Prefix cache: identical 201-token guard prompt 913 ms -> 61.5 ms second time (15x)
+  -> benchmarks must vary prompts or they measure the cache
+- Bread (cold): guard in 4840 ms (incl. 2937 load) + model 11637 ms (incl. 6012 load) + guard out 2648 ms
+- Blocked request: answered in 282 ms, model never runs (vs 1970 ms unguarded)
+- Without guard, llama3.2 refuses hotwiring itself, but finish_reason "stop" -> not machine-readable.
+  Guard gives content_filter + S2, and works independent of which model is behind it
+- Non-streaming output check: user waits for full generation + a guard check before seeing anything
