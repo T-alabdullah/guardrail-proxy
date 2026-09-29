@@ -155,4 +155,33 @@ trade between memory and latency, and the right value depends on how often traff
 
 ## 8. Who should decide whether the guardrail runs?
 
-(See the final question: to be written.)
+**Current design:** the caller decides, with `"guardrails": true/false` in each request.
+
+**Is that good? No.** A guardrail the caller can switch off is not a guardrail, it's an optional feature.
+
+- **The wrong party is in control.** The guardrail protects against harmful requests, but whoever sends
+  a harmful request also decides whether it gets checked. They just send `false`.
+- **The default is off.** A forgotten flag means no protection, and since the OpenAI client doesn't know
+  the flag (it has to go in `extra_body`), forgetting it is the most likely case.
+- **The operator can't guarantee anything.** There's no way to promise that a given application is always checked.
+
+**What should control it instead:** a **policy owned by the platform operator, tied to the caller's
+identity**: the API key, tenant, or application. Different policies are legitimate, but they differ per
+application, not per request:
+
+| Caller | Policy |
+|---|---|
+| Children's app | Guardrail on, every category blocks |
+| Medical app | Guardrail on, S6 (specialized advice) allowed |
+| Internal red team | Guardrail off, explicitly granted and logged |
+
+**Where the decision lives:** in the gateway, **after authentication**, next to rate limiting and usage
+metering. Request arrives → API key identifies the tenant → the tenant's policy is loaded from a
+policy store that admins manage → the policy decides: guardrail on or off, which categories block,
+fail-open or fail-closed, which streaming strategy. Not in the client (can't be trusted) and not in the
+model server (it shouldn't need to know about tenants).
+
+**What happens to the flag:** it can only make things **stricter**, never looser. A caller who knows it
+is serving a minor can ask for stricter checks. If the policy requires the guardrail and the caller sends
+`false`, the request is checked anyway and the attempt is logged. The response's `guardrail` field
+should say which policy was applied.
