@@ -94,3 +94,25 @@ Run 2 (GUARD_TEST_FAKE_UNSAFE_WORD=twenty, simulated unsafe output):
 
 Conclusion D: fast TTFT, but can't prevent leaks; ~20 tokens here. OK for low-severity,
 not for S4/S9. Client must honor content_filter. Hybrid (D normally, C for high risk) is the realistic design.
+
+
+## Step 5a – benchmark (python bench.py 2>&1 | tee results/bench-run1.txt)
+Raw: results/bench-20260929-093154.csv. 5 prompts, nonce per request (no prefix-cache reuse),
+temperature 0, max_tokens 100, medians. Runs very consistent (±4%).
+
+Guardrail overhead (warm):
+- Stream TTFT 327 -> 1306 ms (+300%, +1.0 s = input check)
+- Stream total 8159 -> 13913 ms (+71%); gen 12.6 -> 8.5 tok/s (-33%, guard competes for CPU); tail check 976 ms
+- Non-stream total 7995 -> 10442 ms (+31%); guard 2371 ms; gen unchanged 13.0 tok/s (sequential, no contention)
+- D vs non-stream: first text 8x sooner (1.3 vs 10.4 s) but finishes 3.5 s later on shared hardware
+
+Where the time goes (non-stream):
+- Warm, no guard: generation 96%, prompt 3.6%, load 0.1%, proxy 5 ms (0.1%)
+- Warm, guard: generation 74%, guard 23%
+- Cold: load 3859 ms = 31% (vs 6343 ms at first-ever start: macOS file cache keeps weights in RAM)
+- Cold + guard, stream: TTFT 4380 -> 8353 ms (two models to load)
+
+TTFT vs throughput:
+- TTFT ~ prompt processing (292 ms / ~40 tok, all tokens at once, ~140 tok/s)
+- Throughput ~ generation (12.6-13 tok/s, one token at a time, weights read per token)
+- ~63% of estimated 20 tok/s bandwidth ceiling

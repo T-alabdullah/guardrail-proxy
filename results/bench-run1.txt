@@ -1,0 +1,69 @@
+Warm-up: loading both models (not recorded)
+
+Warm: 1 pass(es) over 5 prompts, guard off/on interleaved
+  stream    guard=False warm: TTFT    417 ms, total   8357 ms
+  stream    guard=True  warm: TTFT   1306 ms, total  13913 ms
+  nonstream guard=False warm: TTFT   8011 ms, total   8011 ms
+  nonstream guard=True  warm: TTFT  10458 ms, total  10458 ms
+  stream    guard=False warm: TTFT    335 ms, total   8164 ms
+  stream    guard=True  warm: TTFT   1304 ms, total  14044 ms
+  nonstream guard=False warm: TTFT   8087 ms, total   8087 ms
+  nonstream guard=True  warm: TTFT  10442 ms, total  10442 ms
+  stream    guard=False warm: TTFT    327 ms, total   8159 ms
+  stream    guard=True  warm: TTFT   1316 ms, total  13891 ms
+  nonstream guard=False warm: TTFT   7995 ms, total   7995 ms
+  nonstream guard=True  warm: TTFT  10370 ms, total  10370 ms
+  stream    guard=False warm: TTFT    302 ms, total   8077 ms
+  stream    guard=True  warm: TTFT   1265 ms, total  13809 ms
+  nonstream guard=False warm: TTFT   7921 ms, total   7921 ms
+  nonstream guard=True  warm: TTFT  10347 ms, total  10347 ms
+  stream    guard=False warm: TTFT    326 ms, total   8013 ms
+  stream    guard=True  warm: TTFT   1342 ms, total  14002 ms
+  nonstream guard=False warm: TTFT   7606 ms, total   7606 ms
+  nonstream guard=True  warm: TTFT  10608 ms, total  10608 ms
+
+Cold: 2 round(s), both models unloaded before each request
+  stream    guard=False cold: TTFT   4464 ms, total  12161 ms
+  stream    guard=True  cold: TTFT   8364 ms, total  21799 ms
+  nonstream guard=False cold: TTFT  12463 ms, total  12463 ms
+  stream    guard=False cold: TTFT   4296 ms, total  12004 ms
+  stream    guard=True  cold: TTFT   8342 ms, total  21688 ms
+  nonstream guard=False cold: TTFT  12240 ms, total  12240 ms
+
+Raw results: results/bench-20260929-093154.csv
+
+=== Summary (medians) ===
+mode      state guard    n   TTFT ms  total ms  tok/s  guard ms  tail ms
+stream    warm  False    5       327      8159   12.6         -        1
+stream    warm  True     5      1306     13913    8.5         -      976
+stream    cold  False    2      4380     12083   12.9         -        1
+stream    cold  True     2      8353     21744    8.0         -     1036
+nonstream warm  False    5      7995      7995   13.0         0        -
+nonstream warm  True     5     10442     10442   13.0      2371        -
+nonstream cold  False    2     12352     12352   12.7         0        -
+
+=== What the guardrail adds (warm, medians) ===
+Streaming TTFT   :    327 ->   1306 ms   (+300%)
+Streaming total  :   8159 ->  13913 ms   (+71%)
+Streaming gen    :   12.6 ->    8.5 tok/s (-33%)
+Non-stream total :   7995 ->  10442 ms   (+31%)
+
+=== Where the time goes (non-streaming, medians) ===
+warm, guard off: total 7995 ms
+   model load                4 ms    0.1%
+   prompt processing       292 ms    3.6%
+   generation             7678 ms   96.0%
+   guard (in + out)          0 ms    0.0%
+   proxy/HTTP/other          5 ms    0.1%
+warm, guard on: total 10442 ms
+   model load                5 ms    0.0%
+   prompt processing       312 ms    3.0%
+   generation             7710 ms   73.8%
+   guard (in + out)       2371 ms   22.7%
+   proxy/HTTP/other          4 ms    0.0%
+cold, guard off: total 12352 ms
+   model load             3859 ms   31.2%
+   prompt processing       604 ms    4.9%
+   generation             7879 ms   63.8%
+   guard (in + out)          0 ms    0.0%
+   proxy/HTTP/other          6 ms    0.0%
