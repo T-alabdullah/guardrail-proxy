@@ -116,3 +116,36 @@ TTFT vs throughput:
 - TTFT ~ prompt processing (292 ms / ~40 tok, all tokens at once, ~140 tok/s)
 - Throughput ~ generation (12.6-13 tok/s, one token at a time, weights read per token)
 - ~63% of estimated 20 tok/s bandwidth ceiling
+
+
+## Step 5b – keep-alive and memory
+Setting: OLLAMA_KEEP_ALIVE (server-wide, default 5m; -1 = never unload),
+or "keep_alive" per request (overrides; 0 = unload now).
+
+Ollama = manager: `ps` shows `ollama serve` (50 MB) + one llama.cpp `llama-server`
+process per loaded model, each on its own port. Flags Ollama sets and hides:
+-c 4096 (context/KV size), -np 1 (one request at a time -> no batching),
+-b/-ub 512 (prompt batch), --flash-attn auto, --context-shift --keep 4.
+Server binary is from /Applications/Ollama.app (explains the port conflict at setup).
+
+Memory of keeping both loaded:
+- ollama ps SIZE: chat 2.6 GB + guard 1.8 GB = 4.4 GB (28% of 16 GB)
+- macOS RSS: ~1.5-1.6 GB per llama-server (~3.0 GB): KV cache reserved but mostly untouched
+- Plan with SIZE (full context fills the cache)
+
+KV cache experiment (llama3.2:3b, num_ctx via API):
+- 4096: 2.6 GB | 8192: 3.1 GB (+0.5) | 16384: 4.1 GB (+1.0)
+- Predicted 2 x 28 layers x 8 kv heads x 128 dims x 2 bytes = ~112 KB/token -> +0.45 / +0.9 GB. Matches.
+- Weights + buffers ~2.15 GB; KV cache is per parallel slot -> memory limits concurrency
+
+Cost of unloading (from 5a): cold TTFT +4.1 s without guard, +7 s with guard (two models load)
+
+Experiment: OLLAMA_MAX_LOADED_MODELS=1 (only one model in memory), guarded non-stream, max_tokens 50:
+- Request 1: 16.6 s, request 2: 13.6 s
+- Request 2: guard in load 4 ms (still loaded) -> chat load 3710 ms (evicts guard)
+  -> guard out load 2244 ms (evicts chat). ~6 s loading = 44% of total, EVERY request. ~+80% vs no swapping
+- Unloading also discards the prefix/KV cache: guard prompt_eval 1501 ms for 201 tokens
+
+Decision: OLLAMA_KEEP_ALIVE=-1 (both models stay loaded).
+Cost 4.4 GB (28% of RAM) permanently; saves 4-7 s cold TTFT + keeps prefix cache.
+Right when traffic is regular and both models are on the critical path; wrong for rarely used services.
