@@ -1,0 +1,13 @@
+ lines  guard prompt tok  prompt ms prompt tok/s gen tok/s  guard ms
+     5  False        110       1062        103.6      14.4         0
+     5   True        110       1171         93.9      14.5      3464
+    25  False        350       3762         93.0      12.4         0
+    25   True        349       3464        100.8      12.5      5598
+    75  False        949       9896         95.9      12.1         0
+    75   True        949      10327         91.9      11.1     12997
+   150  False       1851      23218         79.7      11.1         0
+   150   True       1850      21551         85.8      10.9     28055
+   220  False       2690      32565         82.6       9.7         0
+   220   True       2690      32939         81.7       9.7     40482
+
+Raw results: results/longprompt-20260929-094550.csv

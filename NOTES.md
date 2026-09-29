@@ -149,3 +149,18 @@ Experiment: OLLAMA_MAX_LOADED_MODELS=1 (only one model in memory), guarded non-s
 Decision: OLLAMA_KEEP_ALIVE=-1 (both models stay loaded).
 Cost 4.4 GB (28% of RAM) permanently; saves 4-7 s cold TTFT + keeps prefix cache.
 Right when traffic is regular and both models are on the critical path; wrong for rarely used services.
+
+## Step 5c – long prompt (python longprompt.py 2>&1 | tee results/longprompt-run1.txt)
+Prompt length ~110 -> 2690 tokens, max_tokens 30, nonce per prompt.
+
+- Prompt processing: ~80-100 tok/s, flat/slightly falling with length (prediction "rises" was wrong)
+  -> CPU already compute-bound even for short prompts: 100 tok/s x 6.4 GFLOP/token = ~0.64 TFLOP/s,
+     roughly the i9's AVX2 arithmetic ceiling. Slight drop with length = attention grows with context.
+- Generation: 13 tok/s x 6.4 GFLOP = ~0.08 TFLOP/s = ~10-15% of compute, but ~60% of memory bandwidth
+  -> generation memory-bound, prompt processing compute-bound. Same model, same hardware.
+- Generation slows with context: 14.4 -> 9.7 tok/s. At 2690 tokens each new token also reads
+  ~300 MB of KV cache (2690 x 112 KB) on top of ~2 GB weights.
+- TTFT linear in prompt length: 2690 tokens -> 32.6 s before the first token.
+  Long chats resend the whole history -> prefix caching essential.
+- Guard: 3.5 s -> 40.5 s (reads whole prompt twice, in + out). At 2690 tokens guard > chat model.
+  Guard cost scales with conversation length -> improvement: check only latest turn + limited context.
